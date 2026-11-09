@@ -89,7 +89,7 @@ EQ4_2FS_PARAMS = dict(
 )
 
 EQ5_2FS_PARAMS = dict(
-    steps=50000,
+    steps=250000,
     stepsize=2.0,
     temperature="T_VAR",
     bath_coupling=10.0,
@@ -126,7 +126,7 @@ EQ4_1FS_PARAMS = dict(
 )
 
 EQ5_1FS_PARAMS = dict(
-    steps=100000,
+    steps=500000,
     stepsize=1.0,
     temperature="T_VAR",
     bath_coupling=10.0,
