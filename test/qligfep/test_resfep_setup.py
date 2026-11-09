@@ -318,6 +318,31 @@ class TestSeriesCommands:
         ]
         assert command[-4:] == ["-w", "5", "-r", "2"]
 
+    @qprep_required
+    @structure_required
+    def test_whole_chain_batch_legs_are_set_up_and_recorded(self, tmp_path):
+        import json
+
+        series = self.series(
+            tmp_path, legs=("protein", "peptide"),
+            mutant_pdb_dir=Path(__file__).parent / "resources" / "t4l",
+            qresfep_options=["-w", "2", "-r", "1"],
+        )
+        outcome = series.run()[0]
+        assert outcome.ok, outcome.error
+        assert outcome.legs == ["protein", "peptide"]
+        for leg in outcome.legs:
+            inputs = tmp_path / leg / "FEP_LEU39ALA" / "inputfiles"
+            assert (inputs / "FEP2.fep").exists()
+            config = json.loads((inputs / "resfep_config.json").read_text())
+            assert config["system"] == leg
+            if leg == "peptide":
+                assert len(config["peptide_residues"]) == 164
+
+    def test_invalid_leg_is_rejected(self, tmp_path):
+        with pytest.raises(SetupError, match="Legs must be selected"):
+            self.series(tmp_path, legs=("water",))
+
     def test_cofactors_reach_both_steps_in_the_form_each_expects(self, tmp_path):
         series = self.series(tmp_path, cofactors=["NAD"])
         assert "-cof" in series._qprep_command(LEU39_CB)

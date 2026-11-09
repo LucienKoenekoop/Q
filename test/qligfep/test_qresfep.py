@@ -224,6 +224,105 @@ class TestHeavyAtomMatching:
         assert amino_acids.match_heavy_atoms(["CB"], ["og"], hybrid) == []
 
 
+class TestWholeChainPeptide:
+    @staticmethod
+    def make_run(tmp_path, mutation="LEU10ALA"):
+        from QligFEP.pdb_utils import pdb_parse_in
+
+        run = QresFEP(mutation, "B", "peptide", "OPLSAAM", "SNELLIUS", workdir=tmp_path)
+        run.inputfiles.mkdir(parents=True)
+        run.q_position = 3
+        run.center = [0.0, 0.0, 0.0]
+        run.radius = 25.0
+        run.prep = SpherePrep(
+            "original.pdb", "prepared.pdb", "OPLSAAM", run.center, run.radius, 0,
+            residues=[ResidueMapping(1, 10, "A", "LEU"),
+                      ResidueMapping(2, 9, "B", "CYS"),
+                      ResidueMapping(3, 10, "B", "LEU"),
+                      ResidueMapping(4, 20, "B", "CYS")],
+        )
+        run.pdb = {
+            number: [pdb_parse_in(
+                f"ATOM  {number:5d}  CA  {name:3s} Z{number:4d}    "
+                f"{float(number * 20):8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00           C"
+            )]
+            for number, name in [(1, "LEU"), (2, "CYX"), (3, run.hybrid_name), (4, "CYX"), (5, "LIG")]
+        }
+        return run
+
+    def test_extracts_only_mapped_chain_and_preserves_source(self, tmp_path):
+        run = self.make_run(tmp_path)
+        run.write_complex()
+        lines = (run.inputfiles / "complex.pdb").read_text().splitlines()
+        assert len(lines) == run.system_size == 3
+        assert [int(line[6:11]) for line in lines] == [1, 2, 3]
+        assert [int(line[22:26]) for line in lines] == [1, 2, 3]
+        assert [line[17:20].strip() for line in lines] == ["CYX", run.hybrid_name, "CYX"]
+        assert run.pdb[3][0][6] == 3
+        assert float(lines[-1][30:38]) == 80.0
+
+    def test_filters_and_remaps_disulfides(self, tmp_path):
+        run = self.make_run(tmp_path)
+        run.prep.disulfides = [(2, 4)]
+        run.write_complex()
+        assert run.peptide_disulfides == [(1, 3)]
+
+    def test_cross_chain_disulfide_becomes_free_cysteine(self, tmp_path):
+        run = self.make_run(tmp_path)
+        run.prep.disulfides = [(1, 2)]
+        run.write_complex()
+        assert (run.inputfiles / "complex.pdb").read_text().splitlines()[0][17:20] == "CYS"
+        assert run.peptide_disulfides == []
+        assert run.pdb[2][0][4] == "CYX"
+
+    def test_missing_chain_residue_fails(self, tmp_path):
+        run = self.make_run(tmp_path)
+        del run.pdb[4]
+        with pytest.raises(MutationError, match="missing Q residues"):
+            run.write_complex()
+
+    @pytest.mark.parametrize("mutation", ["LEU10ALA", "ASP10GLU", "ARG10LYS"])
+    def test_equal_formal_charges_skip_probe(self, tmp_path, mutation):
+        run = self.make_run(tmp_path, mutation)
+        run._match_peptide_charge()
+        assert run.peptide_charge is None
+        assert run.counter_ions == 0
+
+    @pytest.mark.parametrize("protein_charge,peptide_charge,ion,count", [
+        (3, 1, "SOD", 2), (-2, 1, "CLA", 3), (1, 1, None, 0),
+    ])
+    def test_charge_probe_uses_wt_endpoint_and_chain_numbering(
+        self, tmp_path, monkeypatch, protein_charge, peptide_charge, ion, count
+    ):
+        run = self.make_run(tmp_path, "ASP10ALA")
+        run.prep.total_charge = protein_charge
+        run.write_complex()
+        run.hybrid_lib_name = "D2A.lib"
+        (run.inputfiles / run.hybrid_lib_name).write_text(
+            "{D2A}\n[atoms]\n1 CA C224 0.140\n2 CB C224 -0.280\n3 cb C224 -0.180\n[bonds]\nCA CB\n"
+        )
+        (run.inputfiles / "qprep.inp").write_text("rl D2A.lib\nrp complex.pdb\nq\n")
+
+        def fake_qprep(input_file, output_file):
+            assert "rl peptide_charge.lib" in (run.inputfiles / input_file).read_text()
+            library = (run.inputfiles / "peptide_charge.lib").read_text()
+            assert "3    cb    C224    0.000" in library
+            assert "2    CB    C224    -0.280" in library
+            (run.inputfiles / output_file).write_text(f"total charge of not excluded: {peptide_charge:.2f}\n")
+
+        monkeypatch.setattr(run, "_run_qprep", fake_qprep)
+        monkeypatch.setattr("QligFEP.counter_ions.minimize_coulomb_on_sphere",
+                            lambda number, radius, center: [(float(index), 0.0, 0.0) for index in range(number)])
+        run._match_peptide_charge()
+        lines = (run.inputfiles / "complex.pdb").read_text().splitlines()
+        assert run.counter_ions == count
+        assert len(lines) == 3 + count
+        assert [int(line[22:26]) for line in lines[3:]] == list(range(4, 4 + count))
+        assert [int(line[6:11]) for line in lines[3:]] == list(range(4, 4 + count))
+        assert all(line[17:20].strip() == ion for line in lines[3:])
+        assert "3 cb C224 -0.180" in (run.inputfiles / run.hybrid_lib_name).read_text()
+
+
 class TestProteinComplexCoordinates:
     def test_crystallographic_waters_are_left_for_the_solvent_sphere(self, tmp_path):
         """The solute complex must not protect a crystal water that clashes with the hybrid."""
@@ -664,6 +763,39 @@ class TestResultDiscovery:
         # Two stages summed per leg: 10 - 4.
         assert record.ddG() == pytest.approx(6.0)
 
+    def test_peptide_reference_is_explicit_and_has_its_own_columns(self, tmp_path):
+        protein, tripeptide, peptide = (tmp_path / name for name in ("protein", "tripeptide", "peptide"))
+        self._make_leg(protein, "LEU39ALA", 5.0)
+        self._make_leg(tripeptide, "LEU39ALA", 2.0)
+        self._make_leg(peptide, "LEU39ALA", 1.0)
+        results = collect(protein, tripeptide, reference_leg="peptide", peptide_dir=peptide)
+        assert set(results[0].legs) == {"protein", "peptide"}
+        assert results[0].ddG(reference_leg="peptide") == pytest.approx(8.0)
+        assert results[0].ddG_sem(reference_leg="peptide") == pytest.approx(0.0)
+        frame = to_frame(results, reference_leg="peptide")
+        assert frame.loc[0, "dG_peptide"] == pytest.approx(2.0)
+        assert frame.loc[0, "ddG_fold"] == pytest.approx(8.0)
+        assert frame.loc[0, "reference_leg"] == "peptide"
+        assert "dG_tripeptide" not in frame
+        assert collect(protein, tripeptide)[0].ddG() == pytest.approx(6.0)
+
+    def test_mislabeled_reference_is_rejected(self, tmp_path):
+        protein, peptide = tmp_path / "protein", tmp_path / "peptide"
+        self._make_leg(peptide, "LEU39ALA", 1.0)
+        inputs = peptide / "FEP_LEU39ALA" / "inputfiles"
+        inputs.mkdir()
+        (inputs / "resfep_config.json").write_text(json.dumps({"system": "tripeptide"}))
+        with pytest.raises(ValueError, match="not the requested 'peptide' leg"):
+            collect(protein, tmp_path / "tripeptide", reference_leg="peptide", peptide_dir=peptide)
+
+    def test_missing_peptide_still_reports_protein(self, tmp_path):
+        self._make_leg(tmp_path / "protein", "LEU39ALA", 5.0)
+        results = collect(tmp_path / "protein", tmp_path / "tripeptide",
+                          reference_leg="peptide", peptide_dir=tmp_path / "peptide")
+        frame = to_frame(results, reference_leg="peptide")
+        assert math.isnan(frame.loc[0, "ddG_fold"])
+        assert frame.loc[0, "n_peptide"] == 0
+
     def test_results_are_ordered_by_position(self, tmp_path):
         protein, tripeptide = tmp_path / "protein", tmp_path / "tripeptide"
         for mutation in ("TYR25GLY", "LEU39ALA", "ILE3THR"):
@@ -777,6 +909,43 @@ class TestRunScriptSafety:
     def test_generated_script_is_valid_bash(self, script):
         subprocess.run(["bash", "-n", script], check=True)
 
+    def test_existing_cluster_without_partition_has_no_partition_directive(self, script):
+        content = script.read_text()
+        assert "#SBATCH --partition=" not in content
+        assert "PARTITION" not in content
+
+    def test_marjorie_uses_compute_partition_without_account(self, tmp_path):
+        run = QresFEP(
+            mutation="LEU39ALA",
+            chain="A",
+            system="protein",
+            force_field="OPLSAAM",
+            cluster="MARJORIE",
+            windows=2,
+            temperature="298",
+            replicates=1,
+            seeds=[971],
+            workdir=tmp_path,
+        )
+        run.inputfiles.mkdir(parents=True)
+        run.write_runfile(
+            [
+                ["md_1_1000_0000", "md_1_0000_1000"],
+                ["md_2_1000_0000", "md_2_0000_1000"],
+            ]
+        )
+
+        script = run.inputfiles / "runMARJORIE.sh"
+        content = script.read_text()
+        subprocess.run(["bash", "-n", script], check=True)
+
+        assert "#SBATCH --partition=compute" in content
+        assert "#SBATCH --ntasks-per-node=8" in content
+        assert "#SBATCH -A" not in content
+        assert "module load openmpi/4.1.7" in content
+        assert "PARTITION" not in content
+        assert "ACCOUNT" not in content
+
     def test_eq_logs_are_recorded_and_removed_before_production(self, script):
         content = script.read_text()
         status = content.index("> equilibration.status")
@@ -822,6 +991,166 @@ def prepared_t4l(tmp_path_factory):
     )
     assert result.returncode == 0, f"qprep_prot failed:\n{result.stderr}"
     return work
+
+
+@qprep_required
+class TestWholeChainTopology:
+    def test_complete_prepared_chain_builds_without_caps(self, prepared_t4l, tmp_path):
+        prep = SpherePrep.read(prepared_t4l)
+        for name in (prep.prepared_pdb, "water.pdb", "prep.json", "ALA39.pdb"):
+            shutil.copy(prepared_t4l / name, tmp_path / name)
+        run = QresFEP("LEU39ALA", "A", "peptide", "OPLSAAM", "SNELLIUS",
+                      windows=2, replicates=1, workdir=tmp_path)
+        directory = run.run() / "inputfiles"
+        lines = (directory / "top_p.pdb").read_text().splitlines()
+        solute = [line for line in lines if line.startswith("ATOM") and line[17:20].strip() not in {"HOH", "SOL", "WAT"}]
+        assert len({int(line[22:26]) for line in solute}) == 164
+        assert not {"ACE", "NMA"} & {line[17:20].strip() for line in solute}
+        assert any(line[17:20] == "L2A" for line in solute)
+        assert (directory / "FEP2.fep").exists()
+        assert run.counter_ions == 0
+        assert run._anchor_restraint()
+
+    @pytest.mark.parametrize("charged_mutant", [False, True])
+    def test_charged_multichain_reference_matches_protein(self, prepared_t4l, tmp_path, charged_mutant):
+        from QligFEP.IO import parse_qprep_total_charge
+        from QligFEP.pdb_utils import pdb_parse_in, pdb_parse_out
+        from QligFEP.sphere_prep import residue_distance_from_center
+
+        original = [pdb_parse_in(line) for line in (T4L_TUTORIAL / "2LZM_prep.pdb").read_text().splitlines()
+                    if line.startswith("ATOM")]
+        residue_numbers = list(dict.fromkeys(atom[6] for atom in original))
+        for offset in range(len(residue_numbers) - 2):
+            numbers = residue_numbers[offset:offset + 3]
+            block = [atom for atom in original if atom[6] in numbers]
+            names = {atom[6]: atom[4] for atom in block}
+            if sum(QresFEP._formal_charge(name) for name in names.values()):
+                break
+        block_center = np.mean([[atom[8], atom[9], atom[10]] for atom in block], axis=0)
+        lines = [pdb_parse_out(atom) for atom in original]
+        for source in block:
+            atom = list(source)
+            atom[1] = len(lines) + 1
+            atom[5] = "B"
+            atom[6] = numbers.index(source[6]) + 1
+            atom[8:11] = (np.array(source[8:11]) - block_center + np.array(LEU39_CB, dtype=float)
+                          + [0.0, 0.0, 8.0]).tolist()
+            lines.append(pdb_parse_out(atom))
+        (tmp_path / "protein.pdb").write_text("\n".join(lines) + "\n")
+        result = subprocess.run(
+            ["qprep_prot", "-i", "protein.pdb", "-FF", "OPLSAAM", "-r", "25", "-sbc", "0", "-cog", *LEU39_CB],
+            cwd=tmp_path, capture_output=True, text=True, timeout=600,
+        )
+        assert result.returncode == 0, result.stderr
+        prep = SpherePrep.read(tmp_path)
+        mutation = next(residue for residue in prep.residues
+                        if residue.chain == "A" and residue.name in {"ASP", "GLU", "LYS", "ARG"}
+                        and residue_distance_from_center(tmp_path / prep.prepared_pdb, residue.q_number, prep.center) < 12)
+        donor = mutation
+        mutant_name = "ALA"
+        if charged_mutant:
+            mutant_name = donor.name
+            mutation = next(residue for residue in prep.residues
+                            if residue.chain == "A" and residue.name == "ALA"
+                            and residue_distance_from_center(tmp_path / prep.prepared_pdb, residue.q_number, prep.center) < 12)
+        backbone = {}
+        for line in (tmp_path / prep.prepared_pdb).read_text().splitlines():
+            if not line.startswith("ATOM") or int(line[22:26]) != mutation.q_number:
+                continue
+            atom = pdb_parse_in(line)
+            backbone[atom[2]] = np.array(atom[8:11])
+        if charged_mutant:
+            template = [pdb_parse_in(line[:54] + "  1.00  0.00")
+                        for line in (tmp_path / "top_p.pdb").read_text().splitlines()
+                        if line.startswith("ATOM") and int(line[22:26]) == donor.q_number]
+        else:
+            template = [pdb_parse_in(amino_acids.normalize_pdb_atom_name(line))
+                        for line in (T4L_RESOURCES / "ALA39.pdb").read_text().splitlines()
+                        if line.startswith("ATOM")]
+        source_frame = np.array([next(atom[8:11] for atom in template if atom[2] == name)
+                                 for name in ("N", "CA", "C")])
+        target_frame = np.array([backbone[name] for name in ("N", "CA", "C")])
+        left, _, right = np.linalg.svd(
+            (source_frame - source_frame.mean(axis=0)).T @ (target_frame - target_frame.mean(axis=0))
+        )
+        correction = np.diag([1.0, 1.0, np.linalg.det(left @ right)])
+        rotation = left @ correction @ right
+        mutant = []
+        for atom in template:
+            atom[8:11] = ((np.array(atom[8:11]) - source_frame.mean(axis=0)) @ rotation
+                          + target_frame.mean(axis=0)).tolist()
+            mutant.append(pdb_parse_out(atom))
+        (tmp_path / f"{mutant_name}{mutation.pdb_number}.pdb").write_text("\n".join(mutant) + "\n")
+        run = QresFEP(f"{mutation.name}{mutation.pdb_number}{mutant_name}", "A", "peptide", "OPLSAAM", "SNELLIUS",
+                      windows=2, replicates=1, workdir=tmp_path)
+        directory = run.run() / "inputfiles"
+        difference = prep.total_charge - run.peptide_charge
+        assert difference != 0
+        assert run.counter_ions == abs(difference)
+        complex_lines = (directory / "complex.pdb").read_text().splitlines()
+        assert len(run.peptide_residues) == 164
+        ions = complex_lines[-run.counter_ions:]
+        assert all(line[17:20].strip() == ("SOD" if difference > 0 else "CLA") for line in ions)
+        assert int(ions[0][22:26]) == 165
+        ion_coordinates = np.array([[float(line[start:start + 8]) for start in (30, 38, 46)] for line in ions])
+        peptide_coordinates = np.array([[float(line[start:start + 8]) for start in (30, 38, 46)]
+                        for line in complex_lines[:-run.counter_ions]])
+        assert np.min(np.linalg.norm(ion_coordinates[:, None] - peptide_coordinates, axis=2)) >= 2.5
+        ghost_charge = round(sum(float(entry.split()[3]) for entry in run.merged_lib["[atoms]"]
+                                 if entry.split()[1].islower()))
+        assert parse_qprep_total_charge(directory / "qprep.out") == prep.total_charge + ghost_charge
+        run._run_qprep("peptide_charge.inp", "peptide_charge_matched.out")
+        assert parse_qprep_total_charge(directory / "peptide_charge_matched.out") == prep.total_charge
+        assert run._wall_restraints()
+
+    @pytest.mark.parametrize("cross_chain", [False, True])
+    def test_qprep_restores_only_retained_disulfides(self, prepared_t4l, tmp_path, cross_chain):
+        from QligFEP.pdb_utils import pdb_parse_in, pdb_parse_out
+
+        prep = SpherePrep.read(prepared_t4l)
+        cysteines = [residue for residue in prep.residues if residue.name == "CYS"]
+        first, second = [residue.q_number for residue in cysteines[:2]]
+        if cross_chain:
+            second = len(prep.residues) + 1
+            prep.residues.append(ResidueMapping(second, 1, "B", "CYX"))
+        prep.disulfides = [(first, second)]
+        atoms = []
+        partner = []
+        for line in (prepared_t4l / prep.prepared_pdb).read_text().splitlines():
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            atom = pdb_parse_in(line)
+            if atom[6] in {first, second}:
+                if atom[2] == "HG":
+                    continue
+                atom[4] = "CYX"
+            atoms.append(atom)
+            if cross_chain and atom[6] == first:
+                other = list(atom)
+                other[6] = second
+                other[5] = "B"
+                partner.append(other)
+        atoms.extend(partner)
+        for serial, atom in enumerate(atoms, 1):
+            atom[1] = serial
+        (tmp_path / prep.prepared_pdb).write_text("".join(pdb_parse_out(atom) + "\n" for atom in atoms))
+        prep.write(tmp_path)
+        for name in ("water.pdb", "ALA39.pdb"):
+            shutil.copy(prepared_t4l / name, tmp_path / name)
+        run = QresFEP("LEU39ALA", "A", "peptide", "OPLSAAM", "SNELLIUS",
+                      windows=2, replicates=1, workdir=tmp_path)
+        directory = run.run() / "inputfiles"
+        local = run.peptide_residues[first]
+        cysteine = [line for line in (directory / "top_p.pdb").read_text().splitlines()
+                    if line.startswith("ATOM") and int(line[22:26]) == local]
+        if cross_chain:
+            assert {line[17:20].strip() for line in cysteine} == {"CYS"}
+            assert "HG" in {line[12:16].strip() for line in cysteine}
+            assert "addbond" not in (directory / "qprep.inp").read_text()
+        else:
+            assert {line[17:20].strip() for line in cysteine} == {"CYX"}
+            assert "HG" not in {line[12:16].strip() for line in cysteine}
+            assert f"addbond {local}:SG {run.peptide_residues[second]}:SG y" in (directory / "qprep.inp").read_text()
 
 
 @qprep_required

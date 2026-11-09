@@ -16,6 +16,7 @@ from ..IO import (
     parse_qprep_total_charge,
     run_qprep,
 )
+from ..functions import _resolve_cog
 from ..logger import logger, setup_logger
 from ..pdb_utils import (
     append_pdb_to_another,
@@ -960,11 +961,10 @@ def parse_arguments() -> argparse.Namespace:
         "--center_of_geometry",
         dest="cog",
         help=(
-            "Center of geometry for the protein. The format is 'x y z', where all numbers "
-            "contain 3 decimal cases. This center of geometry can be obtained using the `qcog ` "
-            "command, but if you include ligands using the `-lig` option, this COG will be "
-            "automatically calculated. If you want to calculate the COG manually, you can use "
-            "this option. Defaults to None."
+            "Center of geometry as 'x y z', or select a PDB atom by using "
+            "'RESI chain residue[icode]' (the residue's CA) or 'ID chain atom_serial'. "
+            "Use '_' for a blank chain ID. RESI residue numbers and ID serials refer to "
+            "the input PDB. Defaults to None."
         ),
         required=False,
         default=None,
@@ -1106,11 +1106,12 @@ def main(
     sphereradius = f"{args.sphereradius:.1f}"
     formatted_solvent_pack = f"{args.solvent_pack:.1f}"
 
-    cog = " ".join(args.cog)
-    logger.debug(f"COG is {cog}")
-
     pdb_file = str(cwd / args.input_pdb_file)
     pdb_path = cwd / args.input_pdb_file
+    pdb_data = read_pdb_to_dataframe(pdb_file)
+    center_coords, cog = _resolve_cog(args.cog, pdb_data, pdb_file)
+    logger.info(f"Using sphere center: {cog}")
+    logger.debug(f"Resolved COG coordinates: {center_coords}")
 
     # Track processing steps for file naming
     processing_steps = []
@@ -1120,7 +1121,6 @@ def main(
 
     # Keep crystallographic waters by default; qprep rejects added solvent that
     # overlaps them.
-    pdb_data = read_pdb_to_dataframe(pdb_file)
     crystal_waters_df = pdb_data.query("residue_name == 'HOH'")
     if not crystal_waters_df.empty:
         water_keys = ["chain_id", "residue_seq_number", "insertion_code"]
@@ -1146,7 +1146,6 @@ def main(
     neutralization_stats = None
     if not args.skip_neutralization:
         logger.info("Neutralizing charged residues outside spherical boundary")
-        center_coords = [float(coord) for coord in args.cog]
         neutralizer = Neutralizer(
             center_coords,
             args.sphereradius,
@@ -1209,7 +1208,6 @@ def main(
 
     # Step 6: Filter out-of-sphere molecular fragments (chains, cofactors, lipids)
     if not args.skip_fragment_filter:
-        center_coords = [float(coord) for coord in args.cog]
         orig_count, filt_count = filter_out_of_sphere_fragments(
             processed_pdb_path, center_coords, float(args.sphereradius)
         )

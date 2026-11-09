@@ -17,27 +17,3 @@ MD = {
 'thermostat'        : 'berendsen'  ,
 'random_seed'       : 1  ,
 } 
-
-#TEST = {
-#        steps
-#        stepsize
-#        temperature
-#        thermostat
-#        random_seed
-#        initial_temperature
-#        shake_solvent
-#        shake_hydrogens
-#        lrf
-#        solute_solute
-#        solvent_solvent
-#        solute_solvent
-#        q_atom
-#        shell_radius
-#        shell_force
-#        radial_force
-#        polarization
-#        non_bond
-#        output
-#        energy
-#        trajectory
-#}

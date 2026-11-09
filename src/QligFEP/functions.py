@@ -1,3 +1,6 @@
+import math
+import re
+
 import numpy as np
 
 from .pdb_utils import pdb_parse_in
@@ -38,6 +41,90 @@ def COG(pdbfile, include="ATOM,HETATM"):
         ]
         center = [round(center[i], 3) for i in range(3)]
     return center
+
+
+def _resolve_cog(cog_args, pdb_data, pdb_file):
+    """Resolve numeric coordinates or a PDB atom selector to a COG.
+
+    Accepted forms are ``x y z``, ``RESI chain residue[icode]``, and
+    ``ID chain atom_serial``. Use ``_`` to select a blank PDB chain ID.
+    """
+    if cog_args is None or len(cog_args) != 3:
+        raise ValueError("COG must be three coordinates, 'RESI chain residue', or 'ID chain atom_serial'")
+
+    selector = cog_args[0].upper()
+    if selector not in {"RESI", "ID"}:
+        try:
+            coords = [float(value) for value in cog_args]
+        except ValueError as err:
+            raise ValueError(
+                "COG must be three numeric coordinates, 'RESI chain residue', "
+                "or 'ID chain atom_serial'"
+            ) from err
+        if not all(math.isfinite(value) for value in coords):
+            raise ValueError("COG coordinates must be finite numbers")
+        # Retain the user's original coordinate tokens for backward compatibility.
+        return coords, " ".join(cog_args)
+
+    chain = "" if cog_args[1] == "_" else cog_args[1]
+    if len(chain) > 1:
+        raise ValueError(f"PDB chain ID must be one character (use '_' for blank), got {cog_args[1]!r}")
+
+    if selector == "RESI":
+        match = re.fullmatch(r"(-?\d+)([A-Za-z]?)", cog_args[2])
+        if not match:
+            raise ValueError(f"Invalid residue selector {cog_args[2]!r}; use a residue number with optional insertion code")
+        residue_number = int(match.group(1))
+        insertion_code = match.group(2).upper()
+        matches = pdb_data.loc[
+            (pdb_data["record_type"] == "ATOM")
+            & (pdb_data["chain_id"].fillna("").astype(str).str.strip() == chain)
+            & (pdb_data["residue_seq_number"] == residue_number)
+            & (pdb_data["insertion_code"].fillna("").astype(str).str.strip().str.upper() == insertion_code)
+            & (pdb_data["atom_name"].astype(str).str.strip().str.upper() == "CA")
+        ]
+        if matches.empty:
+            raise ValueError(
+                f"No CA atom found for RESI {cog_args[1]} {cog_args[2]} in {pdb_file}"
+            )
+
+        # Prefer the canonical blank alternate location, then A. If neither is
+        # present, accept a single alternate; never choose among alternatives silently.
+        alt_locs = matches["alt_loc"].fillna("").astype(str).str.strip().str.upper()
+        if (alt_locs == "").any():
+            matches = matches.loc[alt_locs == ""]
+        elif (alt_locs == "A").any():
+            matches = matches.loc[alt_locs == "A"]
+        elif alt_locs.nunique() > 1:
+            raise ValueError(
+                f"Multiple alternate-location CA atoms found for RESI {cog_args[1]} "
+                f"{cog_args[2]} in {pdb_file}; keep one conformer or select a unique CA"
+            )
+    else:
+        try:
+            serial = int(cog_args[2])
+        except ValueError as err:
+            raise ValueError(f"Invalid atom serial in ID selector: {cog_args[2]!r}") from err
+        matches = pdb_data.loc[
+            (pdb_data["record_type"] == "ATOM")
+            & (pdb_data["chain_id"].fillna("").astype(str).str.strip() == chain)
+            & (pdb_data["atom_serial_number"] == serial)
+        ]
+        if matches.empty:
+            raise ValueError(f"No ATOM record found for ID {cog_args[1]} {serial} in {pdb_file}")
+
+    if len(matches) != 1:
+        details = matches[["chain_id", "residue_name", "residue_seq_number", "insertion_code", "atom_name"]].to_dict("records")
+        raise ValueError(
+            f"COG selector {' '.join(cog_args)!r} matches multiple ATOM records in "
+            f"{pdb_file}: {details}; specify a chain/residue/insertion code that resolves uniquely"
+        )
+
+    row = matches.iloc[0]
+    coords = [float(row[axis]) for axis in ("x", "y", "z")]
+    if not all(math.isfinite(value) for value in coords):
+        raise ValueError(f"COG selector {' '.join(cog_args)!r} has non-finite coordinates in {pdb_file}")
+    return coords, " ".join(f"{value:.3f}" for value in coords)
 
 
 def euclidian_overlap(coord1, coord2, distance):

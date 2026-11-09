@@ -34,7 +34,7 @@ if not BIN.exists():
     )
 
 # some example schrodinger directory
-SCHROD_DIR = r"/mnt/c/Program\sFiles/Schrodinger2022-2/"
+SCHROD_DIR = r"/novo/software/schrodinger/2026-3/"
 
 # quick fix to run .exe files on wsl
 EXE = ".exe"
@@ -181,6 +181,20 @@ HABROK = {
     **Q_PATHS,
 }
 
+MARJORIE = {
+    "NODES": "1",
+    "NTASKS": "8",
+    "PARTITION": "compute",
+    "TIME": "1-00:00:00",  # d-hh:mm:ss
+    "MODULES": nljoin(
+        [
+            "module purge",
+            "module load openmpi/4.1.7",
+        ]
+    ),
+    **Q_PATHS,
+}
+
 LOCAL = {
     "NODES": "1",
     "NTASKS": "1",
@@ -210,6 +224,7 @@ CLUSTER_DICT = {
     "TETRA": TETRA,
     "DARDEL": DARDEL,
     "HABROK": HABROK,
+    "MARJORIE": MARJORIE,
     "LOCAL": LOCAL,
     "LOCALP": LOCALP,
 }

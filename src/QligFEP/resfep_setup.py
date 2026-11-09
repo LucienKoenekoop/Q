@@ -42,7 +42,7 @@ SOLVENT_RESIDUES = frozenset({"HOH", "SOL", "WAT", "TIP3", "T3P"})
 #: GLH, HIP, LYN, ...) are Q's names, not PyMOL's, so they have to be supplied
 #: as ready-made residue PDBs instead.
 PYMOL_RESIDUES = frozenset(
-    "ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split()
+    "ALA ARG ASN ASP CYS GLN GLU GLY HID HIE HIP ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL".split()
 )
 
 _MUTAGENESIS_BLOCK = """
@@ -452,6 +452,8 @@ class MutationSeries:
         self.center = [float(c) for c in center] if center else None
         self.neutralization_offset = float(neutralization_offset)
         self.legs = tuple(legs)
+        if not self.legs or set(self.legs) - {"protein", "tripeptide", "peptide"}:
+            raise SetupError("Legs must be selected from protein, tripeptide and peptide")
         self.cofactors = list(cofactors or [])
         self.mutant_pdb_dir = Path(mutant_pdb_dir).resolve() if mutant_pdb_dir else None
         self.workdir = Path(workdir or Path.cwd()).resolve()

@@ -90,18 +90,18 @@ class MutationResult:
     mutant: str
     legs: dict[str, LegResult] = field(default_factory=dict)
 
-    def ddG(self, estimator: str = "dG_bar") -> float:
-        """Return ddG_fold = dG_protein - dG_tripeptide, or NaN if a leg is missing."""
-        if "protein" not in self.legs or "tripeptide" not in self.legs:
+    def ddG(self, estimator: str = "dG_bar", *, reference_leg: str = "tripeptide") -> float:
+        """Return protein minus the selected reference, or NaN if a leg is missing."""
+        if "protein" not in self.legs or reference_leg not in self.legs:
             return math.nan
-        return self.legs["protein"].mean(estimator) - self.legs["tripeptide"].mean(estimator)
+        return self.legs["protein"].mean(estimator) - self.legs[reference_leg].mean(estimator)
 
-    def ddG_sem(self, estimator: str = "dG_bar") -> float:
+    def ddG_sem(self, estimator: str = "dG_bar", *, reference_leg: str = "tripeptide") -> float:
         """Propagate the two legs' standard errors, which are independent."""
-        if "protein" not in self.legs or "tripeptide" not in self.legs:
+        if "protein" not in self.legs or reference_leg not in self.legs:
             return math.nan
         protein = self.legs["protein"].sem(estimator)
-        reference = self.legs["tripeptide"].sem(estimator)
+        reference = self.legs[reference_leg].sem(estimator)
         if math.isnan(protein) or math.isnan(reference):
             return math.nan
         return math.sqrt(protein**2 + reference**2)
@@ -236,6 +236,9 @@ def collect(
     protein_dir: Path,
     tripeptide_dir: Path,
     temperature: str = "298",
+    *,
+    reference_leg: str = "tripeptide",
+    peptide_dir: Path | None = None,
 ) -> list[MutationResult]:
     """Find every mutation that has been set up and read whatever has finished.
 
@@ -247,8 +250,13 @@ def collect(
         tripeptide_dir: Same for the reference peptide leg.
         temperature: Temperature subdirectory to read.
     """
+    if reference_leg not in {"tripeptide", "peptide"}:
+        raise ValueError("Reference must be tripeptide or peptide")
+    reference_dir = Path(tripeptide_dir) if reference_leg == "tripeptide" else Path(
+        peptide_dir if peptide_dir is not None else "peptide"
+    )
     found: dict[str, MutationResult] = {}
-    for leg, directory in (("protein", Path(protein_dir)), ("tripeptide", Path(tripeptide_dir))):
+    for leg, directory in (("protein", Path(protein_dir)), (reference_leg, reference_dir)):
         if not directory.is_dir():
             logger.warning(f"{directory} does not exist; skipping the {leg} leg")
             continue
@@ -257,6 +265,11 @@ def collect(
             if not match:
                 logger.debug(f"Skipping {fep_dir.name}: not a mutation directory")
                 continue
+            config_path = fep_dir / "inputfiles" / "resfep_config.json"
+            if config_path.exists():
+                system = json.loads(config_path.read_text()).get("system")
+                if system is not None and system != leg:
+                    raise ValueError(f"{fep_dir} holds system {system!r}, not the requested {leg!r} leg")
             wild_type, position, mutant = match.group(1), int(match.group(2)), match.group(3)
             name = f"{wild_type}{position}{mutant}"
             record = found.setdefault(
@@ -270,7 +283,9 @@ def collect(
     return [found[name] for name in sorted(found, key=lambda n: found[n].position)]
 
 
-def to_frame(results: list[MutationResult], estimator: str = "dG_bar") -> pd.DataFrame:
+def to_frame(
+    results: list[MutationResult], estimator: str = "dG_bar", *, reference_leg: str = "tripeptide"
+) -> pd.DataFrame:
     """Lay the results out as one row per mutation.
 
     Args:
@@ -281,10 +296,12 @@ def to_frame(results: list[MutationResult], estimator: str = "dG_bar") -> pd.Dat
         A DataFrame with the per-leg free energies, the folding shift and the
         replicate counts.
     """
+    if reference_leg not in {"tripeptide", "peptide"}:
+        raise ValueError("Reference must be tripeptide or peptide")
     rows = []
     for record in results:
         protein = record.legs.get("protein")
-        reference = record.legs.get("tripeptide")
+        reference = record.legs.get(reference_leg)
         rows.append(
             {
                 "mutation": record.mutation,
@@ -294,11 +311,12 @@ def to_frame(results: list[MutationResult], estimator: str = "dG_bar") -> pd.Dat
                 "dG_protein": protein.mean(estimator) if protein else math.nan,
                 "dG_protein_sem": protein.sem(estimator) if protein else math.nan,
                 "n_protein": protein.n_replicates if protein else 0,
-                "dG_tripeptide": reference.mean(estimator) if reference else math.nan,
-                "dG_tripeptide_sem": reference.sem(estimator) if reference else math.nan,
-                "n_tripeptide": reference.n_replicates if reference else 0,
-                "ddG_fold": record.ddG(estimator),
-                "ddG_fold_sem": record.ddG_sem(estimator),
+                f"dG_{reference_leg}": reference.mean(estimator) if reference else math.nan,
+                f"dG_{reference_leg}_sem": reference.sem(estimator) if reference else math.nan,
+                f"n_{reference_leg}": reference.n_replicates if reference else 0,
+                "reference_leg": reference_leg,
+                "ddG_fold": record.ddG(estimator, reference_leg=reference_leg),
+                "ddG_fold_sem": record.ddG_sem(estimator, reference_leg=reference_leg),
                 "crashes": (len(protein.crashed) if protein else 0)
                 + (len(reference.crashed) if reference else 0),
             }
@@ -370,6 +388,14 @@ def parse_arguments() -> argparse.Namespace:
         help="Directory holding the reference leg's FEP_* directories. Defaults to `tripeptide`.",
     )
     parser.add_argument(
+        "--reference", dest="reference_leg", choices=["tripeptide", "peptide"],
+        default="tripeptide", help="Reference subtracted from protein. Defaults to tripeptide.",
+    )
+    parser.add_argument(
+        "--peptide", dest="peptide_dir", default="peptide",
+        help="Directory holding whole-chain reference FEP_* directories. Defaults to peptide.",
+    )
+    parser.add_argument(
         "-T",
         "--temperature",
         dest="temperature",
@@ -414,14 +440,22 @@ def main(args: argparse.Namespace | None = None) -> pd.DataFrame:
     args = args or parse_arguments()
     setup_logger(level=args.log.upper())
 
-    results = collect(Path(args.protein_dir), Path(args.tripeptide_dir), args.temperature)
+    reference_leg = getattr(args, "reference_leg", "tripeptide")
+    peptide_dir = Path(getattr(args, "peptide_dir", "peptide"))
+    reference_dir = peptide_dir if reference_leg == "peptide" else Path(args.tripeptide_dir)
+    results = collect(
+        Path(args.protein_dir), Path(args.tripeptide_dir), args.temperature,
+        reference_leg=reference_leg, peptide_dir=peptide_dir,
+    )
     if not results:
         logger.warning(
-            f"No FEP_* directories found under {args.protein_dir} or {args.tripeptide_dir}"
+            f"No FEP_* directories found under {args.protein_dir} or {reference_dir}"
         )
         return pd.DataFrame()
 
-    frame = to_frame(results, args.estimator)
+    frame = to_frame(results, args.estimator, reference_leg=reference_leg)
+    if reference_leg == "peptide":
+        logger.info("ddG_fold reports protein minus whole-chain peptide, not an unfolded tripeptide reference")
     if args.experimental:
         frame = compare_to_experiment(frame, Path(args.experimental))
         logger.info(summarize(frame))

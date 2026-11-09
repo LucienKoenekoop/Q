@@ -27,7 +27,8 @@ def parse_arguments() -> argparse.Namespace:
             "holding that residue alone, positioned on the wild-type backbone.\n\n"
             "A complete calculation needs both legs:\n"
             "  qresfep -m LEU39ALA -mc A -S protein    -FF OPLSAAM -c SNELLIUS\n"
-            "  qresfep -m LEU39ALA -mc A -S tripeptide -FF OPLSAAM -c SNELLIUS"
+            "  qresfep -m LEU39ALA -mc A -S tripeptide -FF OPLSAAM -c SNELLIUS\n"
+            "Use -S peptide instead for the complete prepared mutation chain."
         ),
     )
 
@@ -54,11 +55,11 @@ def parse_arguments() -> argparse.Namespace:
         "--system",
         dest="system",
         required=True,
-        choices=["protein", "tripeptide"],
+        choices=["protein", "tripeptide", "peptide"],
         help=(
             "Which leg of the thermodynamic cycle to set up: `protein` for the mutation in "
-            "the folded protein, `tripeptide` for the capped reference peptide. "
-            "ddG_fold is the difference between the two."
+            "the folded protein, `tripeptide` for the capped reference, or `peptide` "
+            "for the mutation's complete prepared chain without additional caps."
         ),
     )
     required.add_argument(
@@ -89,7 +90,7 @@ def parse_arguments() -> argparse.Namespace:
         default="A",
         choices=["A", "G", "X", "Z"],
         help=(
-            "Residues flanking the mutated one in the reference peptide: A (Ala), G (Gly), "
+            "Only for --system tripeptide: residues flanking the mutation: A (Ala), G (Gly), "
             "X (none), Z (the native neighbours). Z gives less stable results for "
             "charge-changing mutations. Defaults to A."
         ),
@@ -313,6 +314,15 @@ def main(args: Optional[argparse.Namespace] = None, **kwargs) -> Path:
                 "seeds": run.seeds,
                 "manuscript_settings": bool(args is not None and getattr(args, "manuscript_settings", False)),
                 "q_position": run.q_position,
+                "peptide_residues": run.peptide_residues,
+                "peptide_disulfides": run.peptide_disulfides,
+                "peptide_freed_cysteines": run.peptide_free_cysteines,
+                "peptide_wt_charge": run.peptide_charge,
+                "peptide_ion_charge": (
+                    run.prep.total_charge - run.peptide_charge if run.peptide_charge is not None else None
+                ),
+                "protein_target_charge": run.prep.total_charge,
+                "counter_ions": run.counter_ions,
                 "hybrid_residue": run.hybrid_name,
                 "sphere_radius": run.radius,
                 "sphere_center": run.center,

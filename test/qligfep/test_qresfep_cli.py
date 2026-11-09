@@ -124,10 +124,40 @@ def test_setup_manuscript_settings_include_preparation(monkeypatch):
     args = setup_resfep_cli.parse_arguments()
 
     for name, expected in MANUSCRIPT_PREPARATION_SETTINGS.items():
+        if name == "legs":
+            expected = ["protein"]
         if isinstance(expected, tuple):
             expected = list(expected)
         assert getattr(args, name) == expected
     assert args.seeds == list(MANUSCRIPT_SEEDS)
+
+
+def test_qresfep_accepts_whole_chain_peptide(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["qresfep", "-m", "LEU39ALA", "-mc", "A",
+                                     "-S", "peptide", "-c", "SNELLIUS"])
+    assert qresfep_cli.parse_arguments().system == "peptide"
+
+
+@pytest.mark.parametrize("manuscript", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_batch_peptide_legs_and_defaults(monkeypatch, manuscript, explicit):
+    command = ["setup_resFEP", "-i", "protein.pdb", "-m", "LEU39ALA", "-mc", "A", "-c", "SNELLIUS"]
+    if explicit:
+        command += ["--legs", "protein", "peptide"]
+    if manuscript:
+        command += ["--manuscript-settings"]
+    monkeypatch.setattr("sys.argv", command)
+    args = setup_resfep_cli.parse_arguments()
+    assert args.legs == ["protein", "peptide" if explicit else "tripeptide"]
+
+
+def test_analysis_selects_whole_chain_reference(monkeypatch):
+    from QligFEP import analyze_resfep
+
+    monkeypatch.setattr("sys.argv", ["qresfep_analyze", "--reference", "peptide", "--peptide", "isolated"])
+    args = analyze_resfep.parse_arguments()
+    assert args.reference_leg == "peptide"
+    assert args.peptide_dir == "isolated"
 
 
 def test_series_passes_flexible_protocol_options_to_every_qresfep_setup():

@@ -11,8 +11,8 @@ the perturbation runs as two consecutive FEP stages.
 
 Stage 2 starts from stage 1's final coordinates, so the pair is one calculation
 split in two. The shift in folding free energy comes from running the same
-mutation twice -- once in the protein, once in a small capped reference peptide
--- and subtracting.
+mutation twice -- once in the protein, once in a capped reference peptide
+or the isolated prepared mutation chain -- and subtracting.
 
 Inputs come from a finished ``qprep_prot`` run in the working directory
 (the prepared protein PDB, ``water.pdb`` and ``prep.json``) plus a PDB of the
@@ -34,7 +34,7 @@ from pathlib import Path
 
 from . import amino_acids
 from .functions import euclidian_overlap, resfep_lambda_ladder, sphere_solute_density
-from .IO import AA, get_force_field_paths, read_prm, replace, run_qprep
+from .IO import AA, get_force_field_paths, parse_qprep_total_charge, read_prm, replace, run_qprep
 from .logger import logger
 from .pdb_utils import pdb_parse_in, pdb_parse_out
 from .peptide_caps import PeptideBuildError, build_reference_peptide
@@ -165,7 +165,7 @@ class QresFEP:
         Args:
             mutation: Mutation in the input PDB's numbering, e.g. ``LEU39ALA``.
             chain: Chain of the mutated residue in the input PDB.
-            system: ``protein`` for the bound leg, ``tripeptide`` for the reference.
+            system: ``protein``, capped ``tripeptide``, or whole-chain ``peptide``.
             force_field: Force field name or path; must match the preparation.
             cluster: Cluster profile from ``CLUSTER_DICT``.
             windows: Lambda windows *per stage*; the total is twice this.
@@ -193,6 +193,8 @@ class QresFEP:
         self.wild_type, self.position, self.mutant = parse_mutation(mutation)
         self.chain = chain
         self.system = system
+        if system not in {"protein", "tripeptide", "peptide"}:
+            raise MutationError(f"Unknown system {system!r}; use protein, tripeptide or peptide")
         self.force_field = force_field
         if self.force_field != QRESFEP_FORCE_FIELD:
             raise MutationError(
@@ -236,6 +238,10 @@ class QresFEP:
         self.anchor_atom: int | None = None
         self.counter_ions = 0
         self.system_size = 0
+        self.peptide_residues: dict[int, int] = {}
+        self.peptide_disulfides: list[tuple[int, int]] = []
+        self.peptide_free_cysteines: list[int] = []
+        self.peptide_charge: int | None = None
 
         self.name = f"{self.wild_type}{self.position}{self.mutant}"
         self.directory = self.workdir / f"FEP_{self.name}"
@@ -379,7 +385,7 @@ class QresFEP:
                 logger.warning(
                     f"{self.directory} already holds the {earlier_system} leg and is about to be "
                     f"overwritten with the {self.system} leg. Move the finished leg out of the way "
-                    "first -- the analysis expects protein/ and tripeptide/ to hold one leg each."
+                    "first -- keep the protein and selected reference legs in separate directories."
                 )
 
         self.inputfiles.mkdir(parents=True, exist_ok=True)
@@ -562,9 +568,13 @@ class QresFEP:
         parameters = read_prm([str(path) for path in self._parameter_files()])
 
         with open(self.inputfiles / "tmp.pdb", "w") as out:
-            for atoms in self.pdb.values():
-                for atom in atoms:
-                    out.write(f"{pdb_parse_out(atom)}\n")
+            if self.system == "peptide":
+                self._write_whole_chain_peptide()
+                out.write((self.inputfiles / "complex.pdb").read_text())
+            else:
+                for atoms in self.pdb.values():
+                    for atom in atoms:
+                        out.write(f"{pdb_parse_out(atom)}\n")
 
         with open(self.inputfiles / "tmp.prm", "w") as out:
             for section in _PARAMETER_SECTIONS:
@@ -579,6 +589,7 @@ class QresFEP:
                     "rprm tmp.prm",
                     "rp tmp.pdb",
                     f"boundary 1 {' '.join(str(c) for c in self.center)} {self.radius}",
+                    *(f"addbond {first}:SG {second}:SG y" for first, second in self.peptide_disulfides),
                     "maketop tmp.top",
                     "q",
                 ]
@@ -646,8 +657,54 @@ class QresFEP:
                 for atoms in self.pdb.values():
                     for atom in atoms:
                         out.write(f"{pdb_parse_out(atom)}\n")
+        elif self.system == "peptide":
+            self._write_whole_chain_peptide()
         else:
             self._write_reference_peptide()
+
+    def _write_whole_chain_peptide(self) -> None:
+        """Keep the mutation's complete prepared chain, without adding caps."""
+        mutation = next(r for r in self.prep.residues if r.q_number == self.q_position)
+        residues = sorted(r.q_number for r in self.prep.residues if r.chain == mutation.chain)
+        missing = [residue for residue in residues if not self.pdb.get(residue)]
+        if missing:
+            raise MutationError(f"Cannot extract complete chain {mutation.chain!r}: missing Q residues {missing}")
+        self.peptide_residues = {residue: index for index, residue in enumerate(residues, 1)}
+        free_cysteines = set()
+        self.peptide_disulfides = []
+        for first, second in self.prep.disulfides:
+            retained = {first, second} & self.peptide_residues.keys()
+            if len(retained) == 2:
+                self.peptide_disulfides.append(
+                    (self.peptide_residues[first], self.peptide_residues[second])
+                )
+            elif retained:
+                free_cysteines.update(retained)
+        self.peptide_free_cysteines = sorted(free_cysteines)
+        if self.q_position in free_cysteines:
+            raise MutationError("Prepare the mutation-site cysteine as a free cysteine before mutating it")
+
+        peptide = []
+        for residue in residues:
+            for source in self.pdb[residue]:
+                atom = list(source)
+                atom[1] = len(peptide) + 1
+                atom[6] = self.peptide_residues[residue]
+                if residue in free_cysteines:
+                    atom[4] = "CYS"
+                peptide.append(atom)
+        self.system_size = len(peptide)
+        self.counter_ions = 0
+        (self.inputfiles / "complex.pdb").write_text(
+            "".join(f"{pdb_parse_out(atom)}\n" for atom in peptide)
+        )
+        if any(
+            sum((float(atom[8 + axis]) - self.center[axis]) ** 2 for axis in range(3)) > self.radius ** 2
+            for atom in peptide
+        ):
+            logger.warning(
+                "The complete peptide is retained, but Q excludes atoms outside the existing sphere"
+            )
 
     def _write_reference_peptide(self) -> None:
         """Cut the mutated residue out and cap it into a small reference peptide.
@@ -686,7 +743,9 @@ class QresFEP:
                 out.write(f"{pdb_parse_out(atom)}\n")
             self.counter_ions = self._append_counter_ions(out, len(peptide))
 
-    def _append_counter_ions(self, out, first_free_serial: int) -> int:
+    def _append_counter_ions(
+        self, out, first_free_serial: int, *, charge: int | None = None, first_residue: int = 6
+    ) -> int:
         """Charge-match the reference sphere to the protein sphere.
 
         A mutation that changes the net charge leaves the two legs at different
@@ -697,16 +756,12 @@ class QresFEP:
         Returns:
             The number of ions written.
         """
-        if not (CHARGED_RESIDUES & {self.wild_type, self.mutant}):
-            return 0
-
         from .counter_ions import minimize_coulomb_on_sphere
 
-        charge = self.prep.total_charge
-        if self.wild_type in ("ASP", "GLU"):
-            charge += 1
-        elif self.wild_type in ("ARG", "LYS", "HIP"):
-            charge -= 1
+        if charge is None:
+            if not (CHARGED_RESIDUES & {self.wild_type, self.mutant}):
+                return 0
+            charge = self.prep.total_charge - self._formal_charge(self.wild_type)
 
         if charge == 0:
             return 0
@@ -716,14 +771,68 @@ class QresFEP:
         positions = minimize_coulomb_on_sphere(abs(charge), placement_radius, self.center)
         ion = "CLA" if charge < 0 else "SOD"
         serial = first_free_serial
-        for residue, (x, y, z) in enumerate(positions, start=6):
+        for residue, (x, y, z) in enumerate(positions, start=first_residue):
             serial += 1
-            out.write(
-                f"ATOM   {serial:4}  {ion} {ion}   {residue:3}     "
-                f"{x:7.3f} {y:7.3f} {z:7.3f}  0.00  0.00           \n"
-            )
+            if self.system == "peptide":
+                out.write(
+                    f"ATOM  {serial:5d}  {ion} {ion}  {residue:4d}    "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}  0.00  0.00           \n"
+                )
+            else:
+                out.write(
+                    f"ATOM   {serial:4}  {ion} {ion}   {residue:3}     "
+                    f"{x:7.3f} {y:7.3f} {z:7.3f}  0.00  0.00           \n"
+                )
         logger.info(f"Added {len(positions)} {ion} ion(s) to match the protein sphere charge")
         return len(positions)
+
+    @staticmethod
+    def _formal_charge(residue: str) -> int:
+        if residue in {"ASP", "GLU"}:
+            return -1
+        return int(residue in {"ARG", "LYS", "HIP"})
+
+    def _match_peptide_charge(self) -> None:
+        """Measure the physical WT endpoint, including Q-built terminal atoms."""
+        if self._formal_charge(self.wild_type) == self._formal_charge(self.mutant):
+            return
+        if int(self.radius) - 11 <= 0:
+            raise MutationError("Peptide charge matching requires a sphere radius of at least 12 A")
+
+        probe_library = "peptide_charge.lib"
+        lines = []
+        in_atoms = False
+        for line in (self.inputfiles / self.hybrid_lib_name).read_text().splitlines():
+            if line.strip().startswith("["):
+                in_atoms = line.strip().startswith("[atoms]")
+            tokens = line.split()
+            if in_atoms and len(tokens) >= 4 and tokens[0].isdigit():
+                tokens[3] = self._charge_pair(tokens[1], tokens[3], True)[0]
+                line = "    " + "    ".join(tokens)
+            lines.append(line)
+        (self.inputfiles / probe_library).write_text("\n".join(lines) + "\n")
+        probe = (self.inputfiles / "qprep.inp").read_text().replace(
+            f"rl {self.hybrid_lib_name}\n", f"rl {probe_library}\n", 1
+        )
+        for original, replacement in (
+            ("dualtop.top", "peptide_charge.top"),
+            ("top_p.pdb", "peptide_charge.pdb"),
+            ("complexnotexcluded.pdb", "peptide_charge_notexcluded.pdb"),
+        ):
+            probe = probe.replace(original, replacement)
+        (self.inputfiles / "peptide_charge.inp").write_text(probe)
+        self._run_qprep("peptide_charge.inp", "peptide_charge.out")
+        self.peptide_charge = parse_qprep_total_charge(self.inputfiles / "peptide_charge.out")
+        difference = self.prep.total_charge - self.peptide_charge
+        with open(self.inputfiles / "complex.pdb", "a") as out:
+            self.counter_ions = self._append_counter_ions(
+                out, self.system_size, charge=difference,
+                first_residue=len(self.peptide_residues) + 1,
+            )
+        logger.info(
+            f"Peptide WT charge {self.peptide_charge:+d}; protein target "
+            f"{self.prep.total_charge:+d}; ion charge {difference:+d}"
+        )
 
     def write_water(self) -> None:
         """Copy the prepared water sphere, dropping molecules that clash with cofactors."""
@@ -768,7 +877,7 @@ class QresFEP:
         libraries += [f"{cofactor}.lib" for cofactor in self.cofactors]
 
         # The protein leg reuses the water sphere built during preparation; the
-        # reference peptide is small enough that qprep solvates it from scratch.
+        # isolated reference is solvated from scratch rather than reusing protein waters.
         solvent = "4 water.pdb" if self.system == "protein" else "1 HOH"
 
         cysbonds = ""
@@ -776,8 +885,13 @@ class QresFEP:
             cysbonds = "".join(
                 f"addbond {first}:SG {second}:SG y\n" for first, second in self.prep.disulfides
             )
+        elif self.system == "peptide":
+            cysbonds = "".join(
+                f"addbond {first}:SG {second}:SG y\n" for first, second in self.peptide_disulfides
+            )
 
-        density = sphere_solute_density(self.protein_pdb, self.center, self.radius)
+        density_pdb = self.inputfiles / "complex.pdb" if self.system == "peptide" else self.protein_pdb
+        density = sphere_solute_density(density_pdb, self.center, self.radius)
         params = QprepResFEPParameters(
             libraries=libraries,
             prm=self.prm_name,
@@ -792,6 +906,8 @@ class QresFEP:
 
     def run_qprep(self) -> None:
         """Build the topology and read back the atom numbering Q assigned."""
+        if self.system == "peptide":
+            self._match_peptide_charge()
         self._run_qprep("qprep.inp", "qprep.out")
         self._read_topology_atom_ids()
         self._read_topology_size()
@@ -1253,6 +1369,8 @@ class QresFEP:
         with open(template) as source, open(target, "w") as out:
             for line in source:
                 if line.strip() == "#SBATCH -A ACCOUNT" and "ACCOUNT" not in substitutions:
+                    continue
+                if line.strip() == "#SBATCH --partition=PARTITION" and "PARTITION" not in substitutions:
                     continue
                 out.write(replace(line, substitutions))
 

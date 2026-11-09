@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from QligFEP.CLI.qprep_cli import Neutralizer, parse_arguments
+from QligFEP.functions import _resolve_cog
 
 
 def _make_atom(record_type, serial, atom_name, residue_name, chain, resnum, x, y, z, element="C"):
@@ -29,6 +30,77 @@ def _make_atom(record_type, serial, atom_name, residue_name, chain, resnum, x, y
         "element_symbol": element,
         "charge": "",
     }
+
+
+class TestCogSelectors:
+    def _pdb_data(self):
+        rows = [
+            _make_atom("ATOM", 10, "CA", "ALA", "A", 42, 1.25, -2.5, 3.75),
+            _make_atom("ATOM", 11, "N", "ALA", "A", 42, 0.0, 0.0, 0.0, "N"),
+            _make_atom("ATOM", 20, "CA", "GLY", "B", 42, 11.0, 12.0, 13.0),
+            _make_atom("ATOM", 30, "CA", "SER", "A", 42, 4.0, 5.0, 6.0),
+            _make_atom("ATOM", 31, "CA", "SER", "A", 42, 4.5, 5.5, 6.5),
+            _make_atom("ATOM", 32, "CA", "THR", "A", 42, 7.0, 8.0, 9.0),
+            _make_atom("HETATM", 40, "CA", "LIG", "A", 43, 14.0, 15.0, 16.0),
+        ]
+        rows[3]["insertion_code"] = "A"
+        rows[4]["insertion_code"] = "A"
+        rows[5]["insertion_code"] = "B"
+        return pd.DataFrame(rows)
+
+    def test_numeric_coordinates_are_preserved(self):
+        coords, qprep_cog = _resolve_cog(["1.250", "-2.500", "3.750"], self._pdb_data(), "protein.pdb")
+        assert coords == [1.25, -2.5, 3.75]
+        assert qprep_cog == "1.250 -2.500 3.750"
+
+    def test_resi_chain_residue_selects_alpha_carbon(self):
+        coords, qprep_cog = _resolve_cog(["RESI", "A", "42"], self._pdb_data(), "protein.pdb")
+        assert coords == [1.25, -2.5, 3.75]
+        assert qprep_cog == "1.250 -2.500 3.750"
+
+    def test_resi_selector_supports_insertion_code(self):
+        coords, _ = _resolve_cog(["RESI", "A", "42B"], self._pdb_data(), "protein.pdb")
+        assert coords == [7.0, 8.0, 9.0]
+
+    def test_blank_chain_uses_underscore(self):
+        data = pd.DataFrame([_make_atom("ATOM", 1, "CA", "ALA", "", 5, 2, 3, 4)])
+        coords, _ = _resolve_cog(["RESI", "_", "5"], data, "protein.pdb")
+        assert coords == [2.0, 3.0, 4.0]
+
+    def test_id_selector_selects_chain_and_serial(self):
+        coords, _ = _resolve_cog(["ID", "B", "20"], self._pdb_data(), "protein.pdb")
+        assert coords == [11.0, 12.0, 13.0]
+
+    def test_id_selector_only_selects_atom_records(self):
+        with pytest.raises(ValueError, match="No ATOM record"):
+            _resolve_cog(["ID", "A", "40"], self._pdb_data(), "protein.pdb")
+
+    def test_unqualified_or_nonunique_residue_is_rejected(self):
+        with pytest.raises(ValueError, match="matches multiple"):
+            _resolve_cog(["RESI", "A", "42A"], self._pdb_data(), "protein.pdb")
+
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            ["RESI", "A", "missing"],
+            ["RESI", "A", "99"],
+            ["ID", "A", "999"],
+            ["ID", "A", "not-a-serial"],
+            ["BOGUS", "A", "42"],
+            ["1.0", "2.0", "nan"],
+            ["1.0", "2.0"],
+        ],
+    )
+    def test_invalid_cog_values_are_rejected(self, selector):
+        with pytest.raises(ValueError):
+            _resolve_cog(selector, self._pdb_data(), "protein.pdb")
+
+    def test_parser_preserves_three_token_cog_interface(self, monkeypatch):
+        monkeypatch.setattr(
+            "sys.argv",
+            ["qprep_prot", "-i", "protein.pdb", "-cog", "RESI", "A", "42"],
+        )
+        assert parse_arguments().cog == ["RESI", "A", "42"]
 
 
 def _build_dna_residue(resname, chain, resnum, x, y, z):

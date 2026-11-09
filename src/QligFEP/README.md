@@ -27,6 +27,40 @@ of ligand parameters using OPLS, how to prepare a protein system, and
 how to run ligand and protein FEP calculations. These examples are 
 based on ligand binding of CDk2 inhibitors.
 
+## Whole-Chain Residue-FEP Reference
+
+After `qprep_prot`, QresFEP can use the mutation's complete prepared chain as
+the reference instead of a capped tripeptide:
+
+```bash
+qresfep -m LEU39ALA -mc A -S peptide -FF OPLSAAM -c SNELLIUS
+```
+
+Only that chain and the hybrid mutation enter the solute coordinates. Other
+chains, separate cofactors and existing waters are excluded; Q adds fresh
+solvent. Prepared termini are retained without new ACE/NMA caps, and `-t`
+applies only to `--system tripeptide`. Intra-chain disulfides are preserved;
+cysteines whose disulfide partner was excluded become free cysteines.
+
+For mutations with different wild-type and mutant formal charges, a preliminary
+Qprep build measures the physical wild-type endpoint charge, including terminal
+chemistry. Sodium or chloride ions match its enclosed charge to the protein
+preparation. The complete chain is retained even beyond the existing sphere,
+but Q excludes outside-sphere atoms from sampling; the sphere is not enlarged.
+
+Batch setup and analysis support explicit peptide reference selection:
+
+```bash
+setup_resFEP -i protein.pdb -m LEU39ALA -mc A -c SNELLIUS --legs protein peptide
+qresfep_analyze --protein protein --reference peptide --peptide peptide
+```
+
+The batch command retains an explicit `--legs` selection with
+`--manuscript-settings`. Defaults remain protein plus tripeptide. Analysis
+retains the `ddG_fold` column for compatibility, but with a peptide reference it
+means protein minus whole-chain peptide, not necessarily an unfolded-state
+folding free energy. The `reference_leg` column records that choice.
+
 # Installing QligFEP and QresFEP  
 
 - Install a working version of Q, e.g.:  

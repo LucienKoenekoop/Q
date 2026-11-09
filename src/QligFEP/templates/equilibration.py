@@ -189,7 +189,7 @@ RESFEP_EQ4_PARAMS = dict(
 #: or 2.5 ns.
 _RESFEP_EQ5_BY_TIMESTEP = {
     "1fs": (500000, 1.0, False),
-    "2fs": (1250000, 2.0, True),
+    "2fs": (250000, 2.0, True),
 }
 
 

@@ -266,8 +266,8 @@ def parse_arguments() -> argparse.Namespace:
         dest="legs",
         nargs="+",
         default=["protein", "tripeptide"],
-        choices=["protein", "tripeptide"],
-        help="Legs of the thermodynamic cycle to set up. Defaults to both.",
+        choices=["protein", "tripeptide", "peptide"],
+        help="Legs to set up. Defaults to protein tripeptide; use protein peptide for a whole-chain reference.",
     )
     optional.add_argument(
         "-o",
@@ -292,8 +292,10 @@ def parse_arguments() -> argparse.Namespace:
         help="Log level. Defaults to info.",
     )
     args = parser.parse_args()
+    selected_legs = args.legs
     if args.manuscript_settings:
         apply_manuscript_settings(args, include_preparation=True)
+    args.legs = selected_legs if selected_legs is not None else ["protein", "tripeptide"]
     return args
 
 
